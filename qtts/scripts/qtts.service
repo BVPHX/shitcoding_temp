@@ -1,0 +1,89 @@
+# ============================================================================
+#  systemd-юнит для Qwen TTS Studio (локальный TTS-сервер + веб-GUI)
+#
+#  Установка:
+#    1) положите проект в /opt/qtts и создайте venv:
+#         sudo mkdir -p /opt/qtts && sudo cp -r . /opt/qtts
+#         cd /opt/qtts && sudo ./scripts/install_rocm.sh --venv /opt/qtts/.venv
+#    2) создайте пользователя и скопируйте юнит:
+#         sudo useradd --system --home-dir /var/lib/qtts --shell /usr/sbin/nologin qtts
+#         sudo cp /opt/qtts/scripts/qtts.service /etc/systemd/system/qtts.service
+#    3) проверьте пути ниже (WorkingDirectory / ExecStart) и запустите:
+#         sudo systemctl daemon-reload
+#         sudo systemctl enable --now qtts
+#         journalctl -u qtts -f          # журнал (в т.ч. этапы генерации)
+#
+#  Данные (config.json, профили голосов, результаты синтеза, лог) живут в
+#  /var/lib/qtts — это StateDirectory=qtts + QTTSS_HOME.
+# ============================================================================
+
+[Unit]
+Description=Qwen TTS Studio — локальный TTS-сервер (Qwen3-TTS, AMD ROCm)
+Documentation=https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qtts
+Group=qtts
+WorkingDirectory=/opt/qtts
+
+# --- где хранить конфиг/профили/результаты ---------------------------------
+Environment=QTTSS_HOME=/var/lib/qtts
+Environment=QTTSS_CONFIG=/var/lib/qtts/config.json
+StateDirectory=qtts
+StateDirectoryMode=0750
+
+# --- запуск ------------------------------------------------------------------
+# --preload: грузим модель сразу (иначе первый запрос ждёт загрузки ~10–30 с)
+# --json-logs: машиночитаемый журнал в stdout → удобно для journalctl/локагрегатора
+ExecStart=/opt/qtts/.venv/bin/qtts serve \
+    --host 127.0.0.1 \
+    --port 8770 \
+    --preload \
+    --json-logs
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+# выход с кодом 3 = занят порт; 1 = не хватает зависимостей (см. qtts serve --help)
+SuccessExitStatus=0
+
+# --- доступ к GPU (ROCm) -----------------------------------------------------
+SupplementaryGroups=render video
+DeviceAllow=/dev/kfd rw
+DeviceAllow=/dev/dri/card0 rw
+DeviceAllow=/dev/dri/card1 rw
+DeviceAllow=/dev/dri/renderD128 rw
+DeviceAllow=/dev/dri/renderD129 rw
+
+# --- переменные ROCm (обычно не нужны: пресет rdna4_rocm10 применяется самим
+#     приложением; раскомментируйте только для отладки проблемных карт) -------
+# Environment=HSA_OVERRIDE_GFX_VERSION=12.0.0
+# Environment=GPU_MAX_ALLOC_PERCENT=100
+# Environment=PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+# Environment=TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+# Environment=HF_HOME=/var/lib/qtts/hf-cache
+
+# --- ресурсы ------------------------------------------------------------------
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+# модель 1.7B в bf16 занимает ~4–5 ГБ VRAM + кэш; не даём OOM-killer'у убивать нас первым
+OOMScoreAdjust=-500
+Nice=0
+
+# --- изоляция (безопасность) ---------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# пишем только в каталог состояния
+ReadWritePaths=/var/lib/qtts
+
+[Install]
+WantedBy=multi-user.target

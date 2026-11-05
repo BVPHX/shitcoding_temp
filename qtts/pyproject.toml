@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-tts-studio"
+version = "0.1.0"
+description = "Локальный TTS-сервер + веб-GUI для Qwen3-TTS (1.7B/0.6B) с оптимизацией под AMD ROCm (RDNA4 / RX 9060 XT)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "qwen-tts-studio" }]
+
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    "numpy>=1.24",
+    "soundfile>=0.12",
+]
+
+[project.optional-dependencies]
+# ВАЖНО: сам torch/torchaudio сюда НЕ входят — их ставим отдельно из индекса ROCm
+# (см. scripts/install_rocm.sh), иначе pip принесёт CPU/CUDA-сборку вместо ROCm.
+tts = [                       # полное ядро Qwen3-TTS (тянет gradio/sox/onnxruntime)
+    "qwen-tts==0.1.1",
+    "librosa>=0.10",
+]
+tts-min = [                   # то же без «тяжести» gradio: qwen-tts ставится с --no-deps
+    "transformers==4.57.3",
+    "accelerate==1.12.0",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "einops>=0.8",
+]
+vllm = [                      # режим прокси к внешнему vLLM-Omni серверу
+    "vllm-omni>=0.20.0",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+qwen-tts-studio = "qtts.__main__:main"
+qtts = "qtts.__main__:main"
+
+[tool.setuptools]
+packages = ["qtts", "qtts.app", "qtts.app.api", "qtts.app.engine", "qtts.app.web"]
+
+[tool.setuptools.package-data]
+"qtts.app.web" = ["*.html", "*.css", "*.js"]
+
+[tool.ruff]
+line-length = 118
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning:starlette.*",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated.*",
+]
+
+[tool.ruff.lint]
+# UP (PEP 585/604-аннотации) намеренно выключен: код последовательно использует
+# typing.Dict/List/Optional и не требует переписывания аннотаций.
+select = ["E", "F", "W", "I", "B", "SIM"]
+ignore = [
+    "E501",    # длина строки (у нас line-length=118, но комментарии бывают длиннее)
+    "B008",    # Depends() в аргументах по умолчанию — норма для FastAPI
+    "SIM105",  # try/except/pass вместо contextlib.suppress: здесь так читаемее
+    "SIM108",  # тернарный оператор не всегда понятнее if/else
+]

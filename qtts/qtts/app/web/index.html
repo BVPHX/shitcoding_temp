@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen TTS Studio</title>
+<link rel="stylesheet" href="/ui/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔊</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">
+      <path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/>
+      <path d="M16.5 8.5a5 5 0 010 7M19 6a8.5 8.5 0 010 12" stroke="currentColor" stroke-width="1.7"
+            fill="none" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <b>Qwen&nbsp;TTS&nbsp;Studio</b>
+      <span class="muted" id="hdr-version">…</span>
+    </div>
+  </div>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="synth" class="tab active">Синтез</button>
+    <button data-tab="profiles" class="tab">Профили голосов</button>
+    <button data-tab="system" class="tab">Система</button>
+    <button data-tab="settings" class="tab">Настройки</button>
+    <button data-tab="logs" class="tab">Журнал</button>
+  </nav>
+
+  <div class="status-cluster">
+    <div class="pill" id="pill-backend" title="Движок синтеза">backend: —</div>
+    <div class="pill" id="pill-gpu" title="Видеокарта и VRAM">GPU: —</div>
+    <div class="pill" id="pill-health" title="Статус">…</div>
+  </div>
+</header>
+
+<main>
+  <!-- ============================== СИНТЕЗ ============================== -->
+  <section id="tab-synth" class="panel active">
+    <div class="grid-2">
+      <div class="card">
+        <h2>Текст</h2>
+        <textarea id="synth-text" rows="10"
+          placeholder="Вставьте текст для озвучивания…"></textarea>
+        <div class="row wrap">
+          <label>Голос
+            <select id="synth-voice"></select>
+          </label>
+          <label>Язык
+            <select id="synth-language"></select>
+          </label>
+          <label>Модель
+            <select id="synth-model"></select>
+          </label>
+          <label>Формат
+            <select id="synth-format">
+              <option value="wav">wav</option>
+              <option value="pcm">pcm (raw 16-bit)</option>
+              <option value="mp3">mp3</option>
+              <option value="ogg">ogg</option>
+              <option value="flac">flac</option>
+            </select>
+          </label>
+        </div>
+        <div class="row wrap">
+          <label class="check"><input type="checkbox" id="synth-stream" checked> стриминг (чанки)</label>
+          <label>Скорость <input type="number" id="synth-speed" value="1" min="0.5" max="2" step="0.05" size="4"></label>
+          <label>Temperature <input type="number" id="synth-temp" step="0.05" min="0.05" max="2" size="4" placeholder="0.9"></label>
+          <label>Top-p <input type="number" id="synth-topp" step="0.05" min="0" max="1" size="4" placeholder="1.0"></label>
+          <label>Top-k <input type="number" id="synth-topk" step="1" min="0" max="200" size="4" placeholder="50"></label>
+          <label>Seed <input type="number" id="synth-seed" step="1" size="6" placeholder="—"></label>
+        </div>
+        <details class="adv">
+          <summary>Инструкция стиля / доп. параметры</summary>
+          <label>instruct (эмоция, манера)
+            <input type="text" id="synth-instruct" placeholder="Скажи это радостно и чуть быстрее">
+          </label>
+          <label>max_new_tokens <input type="number" id="synth-mnt" min="16" max="16384" size="6" placeholder="авто"></label>
+          <label class="check"><input type="checkbox" id="synth-xvec"> x-vector-only (клон без транскрипта)</label>
+        </details>
+        <div class="row">
+          <button class="primary" id="btn-synth">▶ Синтез</button>
+          <button id="btn-synth-ws">⚡ Стриминг (WebSocket)</button>
+          <button class="ghost" id="btn-stop">■ Стоп</button>
+          <span class="muted" id="synth-chars">0 симв.</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Результат</h2>
+        <div class="progress-wrap"><div class="progress" id="synth-progress"></div></div>
+        <div class="kv" id="synth-metrics">
+          <div><span>состояние</span><b id="m-state">—</b></div>
+          <div><span>этап</span><b id="m-stage">—</b></div>
+          <div><span>первый звук (TTFA)</span><b id="m-ttfa">—</b></div>
+          <div><span>всего</span><b id="m-elapsed">—</b></div>
+          <div><span>аудио</span><b id="m-audio">—</b></div>
+          <div><span>RTF</span><b id="m-rtf">—</b></div>
+          <div><span>чанки</span><b id="m-chunks">—</b></div>
+          <div><span>ток/с</span><b id="m-tps">—</b></div>
+        </div>
+        <audio id="synth-audio" controls></audio>
+        <div class="row">
+          <a id="synth-download" class="btn ghost" download="tts.wav">⬇ Скачать</a>
+          <button class="ghost" id="btn-copy-curl">Скопировать curl</button>
+          <button class="ghost" id="btn-to-profile">💾 В профиль…</button>
+        </div>
+        <div id="synth-error" class="error-box hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Очередь и последние задачи</h2>
+      <table class="tbl" id="jobs-table">
+        <thead><tr><th>id</th><th>сост.</th><th>этап</th><th>голос</th><th>симв.</th><th>аудио</th>
+          <th>TTFA</th><th>RTF</th><th>время</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============================== ПРОФИЛИ ============================== -->
+  <section id="tab-profiles" class="panel">
+    <div class="grid-2">
+      <div class="card">
+        <h2>Новый профиль голоса</h2>
+        <p class="muted">Образец 3–10 секунд чистой речи без шума и музыки. Для лучшего сходства
+          заполните транскрипт — модель использует ICL-режим (эталонный текст + кодек-коды).</p>
+        <label>Имя профиля <input type="text" id="pf-name" placeholder="Например: мама"></label>
+        <label>Тип
+          <select id="pf-kind">
+            <option value="clone">clone — клонирование по образцу</option>
+            <option value="preset">preset — встроенный тембр + стиль</option>
+          </select>
+        </label>
+        <div id="pf-clone-fields">
+          <label>Образец голоса
+            <input type="file" id="pf-file" accept="audio/*">
+          </label>
+          <div class="row">
+            <button class="ghost" id="btn-rec">🎙 Записать с микрофона</button>
+            <span class="muted" id="rec-status"></span>
+          </div>
+          <audio id="pf-preview" controls class="hidden"></audio>
+          <label>Транскрипт образца (ref_text)
+            <textarea id="pf-reftext" rows="3" placeholder="Точный текст того, что сказано в образце"></textarea>
+          </label>
+          <label class="check"><input type="checkbox" id="pf-xvec"> x-vector-only (без транскрипта, сходство ниже)</label>
+          <label>Язык образца
+            <select id="pf-language"></select>
+          </label>
+        </div>
+        <div id="pf-preset-fields" class="hidden">
+          <label>Встроенный тембр <select id="pf-speaker"></select></label>
+        </div>
+        <label>Инструкция стиля (instruct)
+          <input type="text" id="pf-instruct" placeholder="Спокойно, тепло, чуть медленнее">
+        </label>
+        <label>Теги (через запятую) <input type="text" id="pf-tags" placeholder="семья, озвучка"></label>
+        <label>Заметки <input type="text" id="pf-notes"></label>
+        <div class="row">
+          <button class="primary" id="btn-create-profile">Создать профиль</button>
+          <button class="ghost" id="btn-analyze">Проанализировать файл</button>
+        </div>
+        <div id="pf-msg" class="msg hidden"></div>
+      </div>
+
+      <div class="card">
+        <h2>Сохранённые профили <span class="muted" id="profiles-count"></span></h2>
+        <div id="profiles-list" class="profiles"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== СИСТЕМА ============================== -->
+  <section id="tab-system" class="panel">
+    <div class="card">
+      <div class="row space">
+        <h2>Проверка режима работы (ROCm / GPU)</h2>
+        <div class="row">
+          <button class="primary" id="btn-diag">🔍 Запустить диагностику</button>
+          <button class="ghost" id="btn-selftest">▶ Тестовый синтез</button>
+          <button class="ghost" id="btn-diag-copy">Копировать отчёт</button>
+        </div>
+      </div>
+      <div id="diag-summary" class="summary"></div>
+      <div id="diag-checks"></div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h2>GPU в реальном времени</h2>
+        <div class="kv" id="gpu-live"></div>
+        <canvas id="gpu-canvas" width="600" height="90"></canvas>
+      </div>
+      <div class="card">
+        <h2>PyTorch / ROCm</h2>
+        <div class="kv" id="torch-info"></div>
+        <h2>Бенчмарк</h2>
+        <div class="kv" id="bench-info"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Модели и движок</h2>
+      <div class="row wrap" id="models-actions"></div>
+      <table class="tbl" id="models-table">
+        <thead><tr><th>ключ</th><th>источник</th><th>тип</th><th>загружена</th><th>устройство</th>
+          <th>dtype</th><th>attn</th><th>VRAM</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Версии пакетов и окружение</h2>
+      <div class="kv" id="versions"></div>
+      <div class="kv" id="env-vars"></div>
+    </div>
+  </section>
+
+  <!-- ============================== НАСТРОЙКИ ============================== -->
+  <section id="tab-settings" class="panel">
+    <div class="grid-2">
+      <div class="card">
+        <h2>Устройство и движок</h2>
+        <label>Backend (декодер)
+          <select id="set-backend">
+            <option value="qwen_tts">qwen_tts — локальный PyTorch/HIP (рекомендуется)</option>
+            <option value="vllm_omni">vllm_omni — прокси на vLLM-Omni (макс. скорость)</option>
+            <option value="dummy">dummy — тестовые тоны (без GPU)</option>
+          </select>
+        </label>
+        <label>Устройство
+          <select id="set-device">
+            <option value="auto">auto (GPU если виден, иначе CPU)</option>
+            <option value="cuda:0">cuda:0 (= HIP/ROCm)</option>
+            <option value="cpu">cpu</option>
+          </select>
+        </label>
+        <label>dtype
+          <select id="set-dtype">
+            <option value="bfloat16">bfloat16 — оптимум для RDNA4</option>
+            <option value="float16">float16</option>
+            <option value="float32">float32 (медленно, для отладки)</option>
+          </select>
+        </label>
+        <label>Attention
+          <select id="set-attn">
+            <option value="auto">auto (flash → sdpa → eager)</option>
+            <option value="sdpa">sdpa (+AOTriton на ROCm)</option>
+            <option value="flash_attention_2">flash_attention_2 (если собран flash-attn)</option>
+            <option value="eager">eager (максимальная совместимость)</option>
+          </select>
+        </label>
+        <label>Источник модели (repo id или путь)
+          <input type="text" id="set-model-source">
+        </label>
+        <label>vLLM-Omni URL <input type="text" id="set-vllm-url" placeholder="http://127.0.0.1:8091"></label>
+        <div class="env-editor">
+          <div class="row space"><h3>Переменные окружения ROCm</h3>
+            <button class="ghost small" id="btn-env-preset">Пресет RDNA4 (ROCm 10)</button>
+          </div>
+          <div id="set-env-list"></div>
+          <button class="ghost small" id="btn-env-add">+ добавить</button>
+          <p class="muted">HSA_*/GPU_* читаются при старте процесса: после изменения сохраните и перезапустите сервер.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Генерация</h2>
+        <label class="check"><input type="checkbox" id="set-streaming"> стриминг (чанки по предложениям)</label>
+        <label>Разбиение текста
+          <select id="set-chunking">
+            <option value="sentence">sentence — по предложениям (быстрый первый звук)</option>
+            <option value="paragraph">paragraph — по абзацам</option>
+            <option value="off">off — одним куском</option>
+          </select>
+        </label>
+        <div class="row wrap">
+          <label>Целевая длина чанка <input type="number" id="set-chunk-target" min="40" max="1200" size="5"></label>
+          <label>Пауза между чанками, мс <input type="number" id="set-gap" min="0" max="1000" size="5"></label>
+          <label>max_new_tokens <input type="number" id="set-mnt" min="64" max="16384" size="6"></label>
+          <label>tokens_per_char <input type="number" id="set-tpc" min="0.5" max="20" step="0.5" size="5"></label>
+        </div>
+        <div class="row wrap">
+          <label>temperature <input type="number" id="set-temp" step="0.05" min="0.05" max="2" size="5"></label>
+          <label>top_k <input type="number" id="set-topk" min="0" max="200" size="5"></label>
+          <label>top_p <input type="number" id="set-topp" step="0.05" min="0" max="1" size="5"></label>
+          <label>repetition_penalty <input type="number" id="set-reppen" step="0.01" min="0.5" max="3" size="5"></label>
+        </div>
+        <label class="check"><input type="checkbox" id="set-nonstream"> non_streaming_mode (быстрее, без симуляции потока)</label>
+        <label class="check"><input type="checkbox" id="set-warmup"> прогрев при загрузке модели</label>
+        <label class="check"><input type="checkbox" id="set-compile"> torch.compile (на ROCm обычно НЕ рекомендуется)</label>
+        <label class="check"><input type="checkbox" id="set-promptcache"> кэш prompt'ов клонирования</label>
+
+        <h2>Аудио</h2>
+        <div class="row wrap">
+          <label>Формат по умолчанию
+            <select id="set-audio-fmt">
+              <option value="wav">wav</option><option value="pcm">pcm</option>
+              <option value="mp3">mp3</option><option value="ogg">ogg</option><option value="flac">flac</option>
+            </select>
+          </label>
+          <label>Частота (0 = как у модели) <input type="number" id="set-sr" min="0" max="96000" step="1000" size="6"></label>
+          <label class="check"><input type="checkbox" id="set-normalize"> нормализовать громкость</label>
+          <label class="check"><input type="checkbox" id="set-save"> сохранять результаты в data/outputs</label>
+          <label>Хранить файлов <input type="number" id="set-keep" min="0" max="10000" size="6"></label>
+        </div>
+
+        <h2>Сервер</h2>
+        <div class="row wrap">
+          <label>host <input type="text" id="set-host" size="12"></label>
+          <label>port <input type="number" id="set-port" min="1" max="65535" size="6"></label>
+          <label>API key <input type="text" id="set-apikey" size="18" placeholder="пусто = без авторизации"></label>
+          <label class="check"><input type="checkbox" id="set-preload"> загружать модель при старте</label>
+        </div>
+        <h2>Логирование</h2>
+        <div class="row wrap">
+          <label>Уровень
+            <select id="set-loglevel">
+              <option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option>
+            </select>
+          </label>
+          <label class="check"><input type="checkbox" id="set-logreq"> логировать внешние запросы</label>
+          <label class="check"><input type="checkbox" id="set-loggen"> логировать этапы генерации</label>
+        </div>
+
+        <div class="row sticky-actions">
+          <button class="primary" id="btn-save-cfg">💾 Сохранить и применить</button>
+          <button class="ghost" id="btn-reload-engine">♻ Перезагрузить движок/модель</button>
+          <button class="ghost" id="btn-check-mode">✅ Проверить режим работы</button>
+          <span id="cfg-msg" class="msg hidden"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== ЖУРНАЛ ============================== -->
+  <section id="tab-logs" class="panel">
+    <div class="card">
+      <div class="row space">
+        <h2>Журнал сервера (в реальном времени)</h2>
+        <div class="row">
+          <select id="log-filter">
+            <option value="">все уровни</option>
+            <option>DEBUG</option><option>INFO</option><option>REQ</option>
+            <option>GEN</option><option>GPU</option><option>WARNING</option><option>ERROR</option>
+          </select>
+          <label class="check"><input type="checkbox" id="log-autoscroll" checked> автопрокрутка</label>
+          <button class="ghost" id="btn-log-clear">Очистить</button>
+          <a class="btn ghost" id="btn-log-download" href="/api/logs/file">⬇ файл лога</a>
+        </div>
+      </div>
+      <pre id="log-view" class="log-view"></pre>
+    </div>
+  </section>
+</main>
+
+<div id="toast-host"></div>
+<script>/*__BOOT__*/</script>
+<script src="/ui/app.js"></script>
+</body>
+</html>
