@@ -245,14 +245,28 @@ class TTSService:
         job.touch(state)
 
     def synthesize_chunks_sync(self, job: Job, req: SynthesisRequest):
-        """Генератор (выполняется в рабочем потоке): (meta, encoded_bytes, last)."""
+        """Генератор (выполняется в рабочем потоке): (meta, encoded_bytes, last).
+
+        Потоковый режим отдаёт ЕДИНЫЙ байтовый поток:
+          * fmt=wav — сначала один RIFF-заголовок (размеры 0xFFFFFFFF, «бесконечный»
+            стрим), затем сырые PCM16-чанки; склейка ответа = один валидный WAV;
+          * fmt=pcm — только сырые PCM16-чанки.
+        Чанки приводятся к выходной частоте/speed/паузам, поэтому поток совпадает
+        с итоговым файлом (который уходит в last-элементе и сохраняется на диске;
+        HTTP-роуты его байты в поток НЕ дублируют).
+        """
         fmt = (req.format or self.cfg.audio.format or "wav").lower()
         streaming = req.streaming if req.streaming is not None else self.cfg.generation.streaming
-        stream_fmt = fmt if fmt in ("pcm", "raw") else "wav" if streaming else fmt
         if streaming and fmt not in ("pcm", "raw", "wav"):
             log.warning("стриминг недоступен для формата '%s' — отдаю единым файлом", fmt)
             streaming = False
-            stream_fmt = fmt
+        stream_fmt = fmt if fmt in ("pcm", "raw") else "wav" if streaming else fmt
+
+        sr_out = self._out_sr(req)
+        speed = req.speed if req.speed is not None else self.cfg.generation.speed
+        speed = float(speed) if speed else 1.0
+        use_speed = abs(speed - 1.0) > 0.01
+        gap_ms = self._gap_ms()
 
         self._queue_guard(job)
         t_start = time.perf_counter()
@@ -261,7 +275,24 @@ class TTSService:
         parts: List[np.ndarray] = []
         idx = 0
         try:
+            if streaming and stream_fmt == "wav":
+                header = audio_mod.wav_stream_header(sr_out)
+                job.bytes_out += len(header)
+                yield (
+                    {
+                        "type": "header",
+                        "job_id": job.id,
+                        "sample_rate": sr_out,
+                        "format": "wav",
+                        "codec": "pcm_s16le",
+                    },
+                    header,
+                    False,
+                )
             progress = self._progress_cb(job)
+            # отмена на уровне движка: ключи с «_» исключаются из kwargs модели (_gen_kwargs).
+            # Перезаписываем всегда: событие должно указывать на ТЕКУЩУЮ задачу.
+            req.gen_overrides = {**(req.gen_overrides or {}), "_cancel_event": job.cancel_event}
             for ev in self.engine.synthesize_chunks(req, progress=progress):
                 if job.cancel_event.is_set():
                     raise EngineError("отменено клиентом", code="cancelled")
@@ -277,16 +308,25 @@ class TTSService:
                 job.audio_sec = round(total_audio, 3)
                 job.progress = (idx / max(1, job.chunks_total or idx))
                 if streaming:
-                    data = self.engine.encode(ev.audio, ev.sample_rate, stream_fmt)
+                    pcm = ev.audio
+                    ev_sr = ev.sample_rate or sr_out
+                    if ev_sr != sr_out:
+                        pcm = audio_mod.resample(pcm, ev_sr, sr_out)
+                    if use_speed:
+                        pcm = self._apply_speed(pcm, speed)
+                    if idx > 1 and gap_ms > 0:
+                        pcm = np.concatenate([audio_mod.add_silence(gap_ms, sr_out), pcm])
+                    data = audio_mod.float_to_pcm16(pcm)
                     job.bytes_out += len(data)
                     meta = {
                         "type": "audio",
                         "job_id": job.id,
                         "index": idx - 1,
                         "total": ev.total or 0,
-                        "sample_rate": ev.sample_rate,
+                        "sample_rate": sr_out,
                         "format": stream_fmt,
-                        "audio_sec": round(ev.audio_sec, 3),
+                        "codec": "pcm_s16le",
+                        "audio_sec": round(len(pcm) / float(sr_out), 3),
                         "gen_ms": ev.gen_ms,
                         "decode_ms": ev.decode_ms,
                         "tok_per_sec": ev.tok_per_sec,
@@ -296,11 +336,9 @@ class TTSService:
                     self.jobs.publish(job)
                     yield meta, data, False
             # ---- финал ----
-            sr_out = self._out_sr(req)
-            wav = audio_mod.concat(parts, gap_ms=self._gap_ms(), sr=sr_out)
-            speed = req.speed if req.speed is not None else self.cfg.generation.speed
-            if speed and abs(float(speed) - 1.0) > 0.01:
-                wav = self._apply_speed(wav, float(speed))
+            wav = audio_mod.concat(parts, gap_ms=gap_ms, sr=sr_out)
+            if use_speed:
+                wav = self._apply_speed(wav, speed)
                 total_audio = len(wav) / float(sr_out)
             data = self.engine.encode(wav, sr_out, fmt)
             elapsed = (time.perf_counter() - t_start) * 1000
@@ -309,7 +347,7 @@ class TTSService:
                 job,
                 "done",
                 audio_sec=round(total_audio, 3),
-                bytes_out=len(data) if not streaming else job.bytes_out + len(data),
+                bytes_out=len(data) if not streaming else job.bytes_out,
                 sample_rate=sr_out,
                 format=fmt,
                 gen_ms=round(elapsed, 1),

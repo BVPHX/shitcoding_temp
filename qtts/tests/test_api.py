@@ -10,6 +10,7 @@ import base64
 import io
 import json
 import re
+import struct
 from pathlib import Path
 
 import pytest
@@ -113,23 +114,38 @@ def test_tts_returns_wav_with_metric_headers(client):
 
 
 def test_tts_streaming_chunked(client):
+    text = TEXT + " Третье предложение. Четвёртое предложение."
     with client.stream("POST", "/api/tts",
-                       json={"text": TEXT + " Третье предложение.", "stream": True,
+                       json={"text": text, "stream": True,
                              "format": "wav", "voice": "vivian"}) as r:
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("audio/wav")
         assert r.headers["x-job-id"]
+        assert int(r.headers["x-sample-rate"]) == 24000
         chunks = list(r.iter_bytes())
     body = b"".join(chunks)
     assert riff_ok(body)
     assert len(body) > 10_000
+    # ЕДИНЫЙ валидный WAV: один RIFF-заголовок, размеры «стримовые» (0xFFFFFFFF),
+    # libsndfile читает до конца потока
+    assert body.count(b"RIFF") == 1
+    assert struct.unpack_from("<I", body, 4)[0] == 0xFFFFFFFF
+    assert struct.unpack_from("<I", body, 40)[0] == 0xFFFFFFFF
+    wav, sr = wav_info(body)
+    assert sr == 24000 and len(wav) == (len(body) - 44) // 2
+    # без дубля аудио: стрим примерно равен цельному файлу (а не в 2 раза больше)
+    full = client.post("/api/tts", json={"text": text, "stream": False, "voice": "vivian"})
+    assert abs(len(body) - len(full.content)) <= 44 + 4
 
 
 def test_tts_pcm_stream_has_raw_content_type(client):
-    r = client.post("/api/tts", json={"text": "Раз. Два.", "format": "pcm", "stream": True})
+    r = client.post("/api/tts", json={"text": "Раз. Два. Три. Четыре.", "format": "pcm", "stream": True})
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("audio/L16;rate=24000")
     assert not riff_ok(r.content) and len(r.content) % 2 == 0
+    # PCM-поток не дублирует аудио финальным файлом
+    full = client.post("/api/tts", json={"text": "Раз. Два. Три. Четыре.", "format": "pcm", "stream": False})
+    assert len(r.content) == len(full.content)
 
 
 def test_tts_json_variant(client):
@@ -148,6 +164,18 @@ def test_tts_audio_endpoint_streams(client):
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("audio/L16")
     assert len(r.content) % 2 == 0 and r.content
+
+
+def test_tts_audio_endpoint_wav_is_single_valid_file(client):
+    r = client.post("/api/tts/audio",
+                    json={"text": "Первое предложение. Второе предложение. Третье предложение.",
+                          "format": "wav"})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("audio/wav")
+    assert riff_ok(r.content)
+    assert r.content.count(b"RIFF") == 1          # ровно один заголовок на весь поток
+    wav, sr = wav_info(r.content)                 # и файл целиком читается
+    assert sr == 24000 and len(wav) == (len(r.content) - 44) // 2
 
 
 def test_tts_sample_rate_override(client):
@@ -281,6 +309,9 @@ def test_openai_speech_stream(client):
     r = client.post("/v1/audio/speech", json={"input": "Стрим. Стрим. Стрим.",
                                               "voice": "vivian", "stream": True})
     assert r.status_code == 200 and r.content
+    assert riff_ok(r.content) and r.content.count(b"RIFF") == 1
+    wav, sr = wav_info(r.content)
+    assert sr == 24000 and len(wav) == (len(r.content) - 44) // 2
 
 
 def test_openai_speech_clone_via_ref(client):

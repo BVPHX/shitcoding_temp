@@ -278,22 +278,6 @@ function playPcm(pcm16, sr) {
   playHead = start + buf.duration;
 }
 
-function parseWav(bytes) {
-  const dv = new DataView(bytes);
-  if (dv.byteLength < 44 || String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]) !== 'RIFF') return null;
-  let off = 12, sr = 24000, dataOff = -1, dataLen = 0;
-  while (off + 8 <= dv.byteLength) {
-    const id = String.fromCharCode(bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]);
-    const size = dv.getUint32(off + 4, true);
-    if (id === 'fmt ') sr = dv.getUint32(off + 12, true);
-    if (id === 'data') { dataOff = off + 8; dataLen = Math.min(size, dv.byteLength - off - 8); }
-    off += 8 + size + (size % 2);
-  }
-  if (dataOff < 0) return null;
-  const pcm = new Int16Array(bytes.buffer, bytes.byteOffset + dataOff, Math.floor(dataLen / 2));
-  return { sr, pcm };
-}
-
 async function synthHttp(body) {
   resetMetrics();
   setMetric('#m-state', 'запрос…');
@@ -325,7 +309,17 @@ async function synthHttp(body) {
 
   if (body.stream) {
     setMetric('#m-state', 'стриминг');
+    // Сервер отдаёт ЕДИНЫЙ поток: для wav — 44-байтовый RIFF-заголовок (размеры
+    // 0xFFFFFFFF) и далее сырые PCM16-чанки; для pcm — сразу PCM16.
+    // Сетевые фрагменты произвольной длины: заголовок добираем по байтам,
+    // нечётный хвост переносим в следующий фрагмент.
+    const isWavStream = !ct.includes('audio/L16') && body.format !== 'pcm';
     const reader = resp.body.getReader();
+    let needHeader = isWavStream ? 44 : 0;
+    let headerBuf = new Uint8Array(0);
+    let streamSr = srHeader;
+    let carry = -1;
+    let nAudio = 0;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -334,13 +328,37 @@ async function synthHttp(body) {
       got += value.length;
       chunks.push(value);
       setMetric('#m-elapsed', fmtMs(performance.now() - started));
-      setMetric('#m-chunks', `${chunks.length}`);
-      if (ct.includes('audio/L16') || body.format === 'pcm') {
-        playPcm(new Int16Array(value.buffer, value.byteOffset, Math.floor(value.byteLength / 2)), srHeader);
-      } else {
-        const w = parseWav(value);
-        if (w) playPcm(w.pcm, w.sr);
+      let view = value;
+      if (needHeader > 0) {
+        const take = Math.min(needHeader, view.length);
+        const nb = new Uint8Array(headerBuf.length + take);
+        nb.set(headerBuf);
+        nb.set(view.subarray(0, take), headerBuf.length);
+        headerBuf = nb;
+        needHeader -= take;
+        view = view.subarray(take);
+        if (needHeader === 0 && headerBuf.length >= 28 &&
+            String.fromCharCode(headerBuf[0], headerBuf[1], headerBuf[2], headerBuf[3]) === 'RIFF') {
+          streamSr = new DataView(headerBuf.buffer, headerBuf.byteOffset, 28).getUint32(24, true) || streamSr;
+        }
       }
+      if (view.length) nAudio++;
+      let pcm = view;
+      if (carry >= 0) {
+        const merged = new Uint8Array(pcm.length + 1);
+        merged[0] = carry;
+        merged.set(pcm, 1);
+        pcm = merged;
+        carry = -1;
+      }
+      if (pcm.length % 2) { carry = pcm[pcm.length - 1]; pcm = pcm.subarray(0, pcm.length - 1); }
+      if (pcm.length) {
+        const dv = new DataView(pcm.buffer, pcm.byteOffset, pcm.length);
+        const i16 = new Int16Array(pcm.length / 2);
+        for (let i = 0; i < i16.length; i++) i16[i] = dv.getInt16(i * 2, true);
+        playPcm(i16, streamSr);
+      }
+      setMetric('#m-chunks', `${nAudio}`);
       pollJob(jobId);
     }
   } else {
@@ -355,6 +373,15 @@ async function synthHttp(body) {
   const all = new Uint8Array(got);
   let pos = 0;
   for (const c of chunks) { all.set(c, pos); pos += c.length; }
+  // Для стрим-WAV пропатчим размеры RIFF/data (в потоке они 0xFFFFFFFF) —
+  // тогда скачанный файл и <audio>-плеер получают полностью валидный WAV.
+  if (body.stream && all.length >= 44 &&
+      String.fromCharCode(all[0], all[1], all[2], all[3]) === 'RIFF' &&
+      String.fromCharCode(all[8], all[9], all[10], all[11]) === 'WAVE') {
+    const dv = new DataView(all.buffer);
+    dv.setUint32(4, all.length - 8, true);
+    dv.setUint32(40, all.length - 44, true);
+  }
   const blob = new Blob([all], { type: ct || 'audio/wav' });
   const url = URL.createObjectURL(blob);
   const audio = $('#synth-audio');

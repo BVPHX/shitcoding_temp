@@ -187,6 +187,7 @@ class VLLMOmniEngine(EngineBase):
         buf = bytearray()
         first = True
         idx = 0
+        cancel = (req.gen_overrides or {}).get("_cancel_event")
         try:
             with self._http().stream("POST", f"{self.base_url}/v1/audio/speech", json=payload) as r:
                 if r.status_code != 200:
@@ -195,6 +196,8 @@ class VLLMOmniEngine(EngineBase):
                 for piece in r.iter_bytes(chunk_size=48_000):
                     if not piece:
                         continue
+                    if cancel is not None and getattr(cancel, "is_set", lambda: False)():
+                        raise EngineError("генерация отменена пользователем", code="cancelled")
                     if first:
                         log.log(GEN, "Этап: первый аудио-пакет от vLLM за %.0f мс", (time.perf_counter() - t0) * 1000)
                         first = False

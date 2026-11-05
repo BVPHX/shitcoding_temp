@@ -1,0 +1,12 @@
+{
+  "name": "qtts-gui-tests",
+  "private": true,
+  "description": "Зависимости smoke-теста веб-GUI (tests/gui_smoke.mjs)",
+  "scripts": {
+    "smoke": "node gui_smoke.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1",
+    "ws": "^8.22.1"
+  }
+}

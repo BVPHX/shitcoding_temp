@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node (GUI smoke-тест)
+node_modules/
+
+# Данные приложения
+data/
+outputs/
+*.wav
+!tests/fixtures/*.wav
+
+# Логи
+*.log

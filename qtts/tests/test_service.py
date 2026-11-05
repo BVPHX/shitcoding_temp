@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import struct
 from pathlib import Path
 
 import pytest
@@ -135,22 +136,42 @@ def test_normalize_language(service, raw, expected):
 
 # ------------------------------------------------------------------ синтез
 
-def test_streaming_wav_yields_audio_then_final(service):
-    r = req("Первое предложение. Второе предложение.", voice=voice(service), format="wav")
+def test_streaming_wav_yields_header_audio_then_final(service):
+    r = req("Первое предложение. Второе предложение. Третье предложение. "
+            "Четвёртое предложение. Пятое предложение.",
+            voice=voice(service), format="wav")
     job = service.jobs.create(r, client="test", endpoint="/api/tts")
     items = list(service.synthesize_chunks_sync(job, r))
 
     metas = [m for m, _d, _l in items]
-    assert [m["type"] for m in metas] == ["audio"] * (len(metas) - 1) + ["final"]
+    types = [m["type"] for m in metas]
+    assert types[0] == "header" and types[-1] == "final"
+    assert all(t == "audio" for t in types[1:-1])
+    n_audio = len(metas) - 2
+    assert n_audio >= 2  # текст из трёх предложений режется на чанки
     assert items[-1][2] is True and all(not it[2] for it in items[:-1])
-    for m, data, _ in items[:-1]:
-        assert data[:4] == b"RIFF" and m["format"] == "wav"
+
+    # заголовок — «бесконечный» RIFF (размеры 0xFFFFFFFF), чанки — сырой PCM16 без контейнера
+    hdr = items[0][1]
+    assert hdr[:4] == b"RIFF" and hdr[8:12] == b"WAVE" and len(hdr) == 44
+    assert struct.unpack_from("<I", hdr, 4)[0] == 0xFFFFFFFF
+    assert struct.unpack_from("<I", hdr, 40)[0] == 0xFFFFFFFF
+    assert struct.unpack_from("<I", hdr, 24)[0] == 24000
+    for m, data, _ in items[1:-1]:
+        assert data[:4] != b"RIFF" and len(data) % 2 == 0
+        assert m["format"] == "wav" and m["codec"] == "pcm_s16le"
         assert m["sample_rate"] == 24000 and m["audio_sec"] > 0
 
     final = metas[-1]
-    assert final["chunks"] == len(metas) - 1
+    assert final["chunks"] == n_audio
     assert final["audio_sec"] > 0 and final["rtf"] > 0 and final["ttfa_ms"] > 0
     assert final["bytes"] == len(items[-1][1])
+
+    # поток (заголовок + PCM) по объёму данных совпадает с итоговым файлом:
+    # никакой «склейки нескольких WAV» и никакого дубля аудио в конце
+    stream_pcm = sum(len(d) for m, d, _ in items[:-1] if m["type"] == "audio")
+    assert stream_pcm == len(items[-1][1]) - 44
+    assert job.bytes_out == 44 + stream_pcm
 
     assert job.state == "done" and job.progress == 1.0
     assert job.chunks_done == final["chunks"] and job.chunks_total == final["chunks"]
@@ -240,6 +261,43 @@ def test_cancelled_job_stops_generation(service):
         list(service.synthesize_chunks_sync(job, r))
     assert ei.value.code == "cancelled"
     assert job.state == "cancelled"
+
+
+def test_engine_receives_cancel_event(service):
+    """Движок должен видеть job.cancel_event через gen_overrides['_cancel_event'] —
+    это включает отмену прямо в цикле генерации qwen/vllm движков."""
+    r = req("Проверка проброса события отмены.", voice=voice(service), format="pcm")
+    job = service.jobs.create(r)
+    engine = service.engine
+    orig = engine.synthesize_chunks
+    seen = {}
+
+    def spy(req_, progress=None):
+        seen["cancel"] = (req_.gen_overrides or {}).get("_cancel_event")
+        return orig(req_, progress=progress)
+
+    engine.synthesize_chunks = spy
+    try:
+        list(service.synthesize_chunks_sync(job, r))
+    finally:
+        engine.synthesize_chunks = orig
+    assert seen["cancel"] is job.cancel_event
+    # событие отмены, выставленное «на лету», прерывает генерацию внутри движка
+    job2 = service.jobs.create(r)
+    captured = {}
+
+    def spy2(req_, progress=None):
+        captured["ev"] = (req_.gen_overrides or {}).get("_cancel_event")
+        captured["ev"].set()          # имитируем отмену клиентом во время работы движка
+        return orig(req_, progress=progress)
+
+    engine.synthesize_chunks = spy2
+    try:
+        with pytest.raises(EngineError) as ei:
+            list(service.synthesize_chunks_sync(job2, r))
+        assert ei.value.code == "cancelled"
+    finally:
+        engine.synthesize_chunks = orig
 
 
 def test_queue_limit_rejects_request(cfg):

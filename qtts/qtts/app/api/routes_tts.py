@@ -134,8 +134,16 @@ async def tts(body: TTSRequest, request: Request, svc: TTSService = Depends(get_
 
     if req.streaming:
         async def gen():
+            sent = False
             try:
                 async for item in svc.stream_synthesis(job, req):
+                    if item["last"]:
+                        # цельный файл в поток не дублируем — но если стриминг
+                        # вырожден в одиночный файл (mp3/ogg/…), отдаём его целиком
+                        if not sent:
+                            yield item["data"]
+                        continue
+                    sent = True
                     yield item["data"]
             except EngineError as exc:
                 log.error("стриминг job=%s прерван: %s", job.id, exc)
@@ -176,6 +184,8 @@ async def tts_audio(body: TTSRequest, request: Request, svc: TTSService = Depend
     async def gen():
         try:
             async for item in svc.stream_synthesis(job, req):
+                if item["last"]:
+                    continue  # цельный файл не дублируем в поток
                 yield item["data"]
         except EngineError as exc:
             log.error("стрим job=%s: %s", job.id, exc)
@@ -236,8 +246,14 @@ async def openai_speech(body: TTSRequest, request: Request, svc: TTSService = De
         fmt = "pcm" if req.format in ("pcm", "raw") else req.format
 
         async def gen():
+            sent = False
             try:
                 async for item in svc.stream_synthesis(job, req):
+                    if item["last"]:
+                        if not sent:
+                            yield item["data"]  # стриминг вырожден в одиночный файл (mp3/…)
+                        continue
+                    sent = True
                     yield item["data"]
             except EngineError as exc:
                 log.error("стрим /v1/audio/speech job=%s: %s", job.id, exc)
@@ -345,9 +361,12 @@ async def ws_tts(ws: WebSocket, _auth: None = Depends(ws_require_auth)):
         {"cancel": "<job_id>"}
     Сервер → клиент:
         {"event":"job","job_id":"..."}                     — задача принята
-        {"event":"progress", ...}                           — этапы/чанки
-        <binary frame>                                      — аудио-чанк
-        {"event":"done", "audio_sec":..., "rtf":...}        — готово
+        {"event":"progress", ...}                           — этапы/чанки (type: header|audio)
+        <binary frame>                                      — байты единого аудиопотока:
+                                                              для format=pcm это сырые PCM16-чанки,
+                                                              для format=wav первый кадр — RIFF-заголовок
+                                                              (размеры 0xFFFFFFFF), далее PCM16-чанки
+        {"event":"done", "audio_sec":..., "rtf":...}        — готово (без дубля аудио)
         {"event":"error","error":"...","code":"..."}        — ошибка
     """
     await ws.accept()

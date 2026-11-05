@@ -421,6 +421,24 @@ def wav_header(data_bytes: int, sr: int, channels: int = 1, sample_width: int = 
     )
 
 
+def wav_stream_header(sr: int, channels: int = 1, sample_width: int = 2) -> bytes:
+    """Заголовок RIFF для потокового WAV, когда итоговая длина заранее неизвестна.
+
+    Размеры RIFF и data выставляются в 0xFFFFFFFF — общепринятая конвенция
+    «бесконечного» стрима: ffmpeg/ffplay, VLC, libsndfile (soundfile) и браузеры
+    читают такой файл до конца потока, а клиент при сохранении может пропатчить
+    реальные размеры (GUI делает это автоматически).
+    """
+    import struct
+
+    byte_rate = sr * channels * sample_width
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 0xFFFFFFFF, b"WAVE", b"fmt ", 16, 1, channels,
+        sr, byte_rate, channels * sample_width, sample_width * 8, b"data", 0xFFFFFFFF,
+    )
+
+
 def save_output(data: bytes, directory: Path, fmt: str, prefix: str = "tts") -> Optional[Path]:
     try:
         directory.mkdir(parents=True, exist_ok=True)
